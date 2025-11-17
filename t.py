@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import shutil
 import json
+import glob
 from datetime import datetime
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtCore import QThread, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, Qt
@@ -80,6 +81,17 @@ WATERMARK_POSITIONS = {
     "Bottom Right": "w-text_w-10:h-text_h-10"
 }
 
+# Voice customization templates
+VOICE_TEMPLATES = {
+    "Normal": {"pitch": 0, "speed": 1.0, "rate": "+0%", "volume": 1.0},
+    "Deep Voice": {"pitch": -8, "speed": 0.9, "rate": "-10%", "volume": 1.0},
+    "Horror Voice": {"pitch": -12, "speed": 0.85, "rate": "-15%", "volume": 0.9},
+    "Scary Voice": {"pitch": -15, "speed": 0.8, "rate": "-20%", "volume": 0.85},
+    "High Pitch": {"pitch": 8, "speed": 1.1, "rate": "+10%", "volume": 1.0},
+    "Slow & Deep": {"pitch": -6, "speed": 0.75, "rate": "-25%", "volume": 1.0},
+    "Fast & Energetic": {"pitch": 4, "speed": 1.2, "rate": "+20%", "volume": 1.1}
+}
+
 # -------- utilities --------
 def run_ffmpeg_command(cmd: str) -> bool:
     try:
@@ -97,6 +109,50 @@ def master_audio(input_audio_path: str, output_audio_path: str, normalize: bool 
         cmd = f'ffmpeg -y -i "{input_audio_path}" -af "loudnorm=I=-16:TP=-1.5:LRA=11, highpass=f=200" "{output_audio_path}"'
     else:
         cmd = f'ffmpeg -y -i "{input_audio_path}" -af "highpass=f=200" "{output_audio_path}"'
+    return run_ffmpeg_command(cmd)
+
+def apply_voice_effects(input_audio_path: str, output_audio_path: str, pitch: int = 0, speed: float = 1.0, volume: float = 1.0) -> bool:
+    """Apply voice customization effects (pitch, speed, volume)"""
+    filters = []
+    
+    # Apply pitch shift (in semitones, -12 to +12)
+    # Using asetrate + aresample for pitch (changes pitch without changing speed)
+    if pitch != 0:
+        pitch_factor = 2 ** (pitch / 12.0)  # Convert semitones to frequency ratio
+        # Change sample rate to shift pitch, then resample back to original
+        filters.append(f"asetrate=44100*{pitch_factor}")
+        filters.append("aresample=44100")
+        # Compensate speed change from pitch shift
+        if pitch_factor != 1.0:
+            filters.append(f"atempo={1.0/pitch_factor:.3f}")
+    
+    # Apply speed/tempo
+    if speed != 1.0:
+        # Limit speed to reasonable range
+        speed = max(0.5, min(2.0, speed))
+        if speed != 1.0:
+            # Chain multiple atempo if needed (atempo only supports 0.5-2.0 range)
+            remaining_speed = speed
+            while remaining_speed > 2.0:
+                filters.append("atempo=2.0")
+                remaining_speed /= 2.0
+            while remaining_speed < 0.5:
+                filters.append("atempo=0.5")
+                remaining_speed /= 0.5
+            if abs(remaining_speed - 1.0) > 0.01:
+                filters.append(f"atempo={remaining_speed:.3f}")
+    
+    # Apply volume
+    if volume != 1.0:
+        filters.append(f"volume={volume:.2f}")
+    
+    if filters:
+        filter_chain = ",".join(filters)
+        cmd = f'ffmpeg -y -i "{input_audio_path}" -af "{filter_chain}" "{output_audio_path}"'
+    else:
+        # No effects, just copy
+        cmd = f'ffmpeg -y -i "{input_audio_path}" -c copy "{output_audio_path}"'
+    
     return run_ffmpeg_command(cmd)
 
 def download_video(url: str, outpath: str, quality_preset: dict, platform: str):
@@ -142,7 +198,7 @@ class Worker(QThread):
     def __init__(self, urls, language_code, voice_name, bg_volume=30, output_folder=OUTPUT_FOLDER, 
                  watermark_text="", quality_preset=None, generate_subtitles=False,
                  audio_normalize=True, retry_attempts=2, platform="tiktok", 
-                 watermark_position="Bottom Right"):
+                 watermark_position="Bottom Right", voice_pitch=0, voice_speed=1.0, voice_volume=1.0):
         super().__init__()
         self.urls = urls
         self.language_code = language_code
@@ -156,6 +212,9 @@ class Worker(QThread):
         self.retry_attempts = retry_attempts
         self.platform = platform
         self.watermark_position = watermark_position
+        self.voice_pitch = voice_pitch
+        self.voice_speed = voice_speed
+        self.voice_volume = voice_volume
         self._stop = False
 
     def stop(self):
@@ -186,7 +245,6 @@ class Worker(QThread):
             self.finished_signal.emit(0, total)
             return
 
-        translator = Translator()
         for idx, url in enumerate(self.urls, start=1):
             if self._stop:
                 self.log_signal.emit("Stopped by user.", "warning")
@@ -198,7 +256,7 @@ class Worker(QThread):
             # Retry logic
             for attempt in range(self.retry_attempts + 1):
                 try:
-                    ok = await self._process_single(url, temp_dir, model, translator)
+                    ok = await self._process_single(url, temp_dir, model)
                     if ok:
                         success += 1
                         break
@@ -219,7 +277,7 @@ class Worker(QThread):
         self.progress_signal.emit(100, "Processing complete!")
         self.finished_signal.emit(success, total)
 
-    async def _process_single(self, url, temp_dir, model, translator) -> bool:
+    async def _process_single(self, url, temp_dir, model) -> bool:
         video_id_match = re.search(r"/video/(\d+)", url) or re.search(r"shorts/([^/?]+)", url) or re.search(r"reel/([^/?]+)", url)
         filename = f"{self.platform}_{video_id_match.group(1) if video_id_match else datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
         temp_video_path = os.path.join(temp_dir, filename)
@@ -239,8 +297,8 @@ class Worker(QThread):
         base = os.path.splitext(filename)[0]
         extracted_audio = os.path.join(temp_dir, f"{base}_orig.wav")
         music_audio = os.path.join(temp_dir, f"{base}_music.wav")
-        translated_audio = os.path.join(temp_dir, f"{base}_{self.language_code}.mp3")
-        mastered_audio = os.path.join(temp_dir, f"{base}_{self.language_code}_master.mp3")
+        translated_audio = os.path.join(temp_dir, f"{base}_{self.language_code}.m4a")
+        mastered_audio = os.path.join(temp_dir, f"{base}_{self.language_code}_master.m4a")
         video_no_audio = os.path.join(temp_dir, f"{base}_noaudio.mp4")
         final_with_watermark = os.path.join(temp_dir, f"{base}_watermark.mp4")
 
@@ -269,7 +327,7 @@ class Worker(QThread):
                 self.log_signal.emit(f"Transcription failed: {e}", "error")
                 return False
 
-            if not english_text:
+            if not english_text or not segments:
                 self.log_signal.emit("No speech detected.", "error")
                 return False
 
@@ -293,29 +351,256 @@ class Worker(QThread):
                 except Exception as e:
                     self.log_signal.emit(f"Subtitle generation failed: {e}", "warning")
 
-            # Translate
-            self.log_signal.emit(f"Translating to {self.language_code}...", "info")
-            try:
-                maybe = translator.translate(english_text, src="en", dest=self.language_code)
-                if asyncio.iscoroutine(maybe) or inspect.isawaitable(maybe):
-                    translation = await maybe
-                else:
-                    translation = maybe
-                translated_text = getattr(translation, "text", None)
-                if not translated_text:
-                    self.log_signal.emit("Translation returned empty text.", "error")
-                    return False
-            except Exception as e:
-                self.log_signal.emit(f"Translation failed: {e}", "error")
-                return False
+            # Translate and generate TTS per segment with timing adjustment
+            self.log_signal.emit(f"Translating and generating speech with timing sync...", "info")
+            
+            segment_audio_files = []
+            translator = Translator()
+            
+            for idx, segment in enumerate(segments):
+                if self._stop:
+                    break
 
-            # TTS with timing adjustment
-            self.log_signal.emit("Generating speech (TTS)...", "info")
+                segment_text = segment.get('text', '').strip()
+                if not segment_text:
+                    continue
+
+                segment_start = segment['start']
+                segment_end = segment['end']
+                segment_duration = segment_end - segment_start
+                # Skip segments that are too short (less than 0.1 seconds)
+                if segment_duration < 0.1:
+                    continue
+
+                # Translate this segment
+                try:
+                    maybe = translator.translate(segment_text, src="en", dest=self.language_code)
+                    if asyncio.iscoroutine(maybe) or inspect.isawaitable(maybe):
+                        translation = await maybe
+                    else:
+                        translation = maybe
+                    translated_segment = getattr(translation, "text", None)
+                    if not translated_segment:
+                        translated_segment = segment_text  # Fallback to original
+                except Exception as e:
+                    self.log_signal.emit(f"Translation failed for segment {idx+1}: {e}", "warning")
+                    translated_segment = segment_text  # Fallback to original
+
+                # Generate TTS for this segment
+                segment_audio_raw = os.path.join(temp_dir, f"{base}_segment_{idx}_raw.mp3")
+                try:
+                    communicate = edge_tts.Communicate(translated_segment, self.voice_name)
+                    await communicate.save(segment_audio_raw)
+                except Exception as e:
+                    self.log_signal.emit(f"TTS failed for segment {idx+1}: {e}", "warning")
+
+                if not os.path.exists(segment_audio_raw):
+                    continue
+
+                # Apply voice customization effects if any
+                segment_audio = os.path.join(temp_dir, f"{base}_segment_{idx}.mp3")
+                if self.voice_pitch != 0 or self.voice_speed != 1.0 or self.voice_volume != 1.0:
+                    if not apply_voice_effects(segment_audio_raw, segment_audio,
+                                             self.voice_pitch, self.voice_speed, self.voice_volume):
+                        # If effects fail, use raw audio
+                        shutil.copyfile(segment_audio_raw, segment_audio)
+                else:
+                    shutil.copyfile(segment_audio_raw, segment_audio)
+
+                # Get actual duration of generated TTS
+                try:
+                    probe_cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{segment_audio}"'
+                    result_probe = subprocess.run(probe_cmd, shell=True, capture_output=True, text=True, timeout=10)
+                    tts_duration_str = result_probe.stdout.strip()
+                    if tts_duration_str:
+                        tts_duration = float(tts_duration_str)
+                        # Validate duration is reasonable
+                        if tts_duration <= 0 or tts_duration > 300:  # Max 5 minutes per segment
+                            tts_duration = segment_duration
+                    else:
+                        tts_duration = segment_duration
+                except:
+                    # If we can't get duration, estimate from segment duration
+                    tts_duration = segment_duration
+
+                # Adjust TTS duration to be more natural - don't force exact match
+                # Strategy: Only adjust speed moderately, allow natural pacing
+                adjusted_audio = os.path.join(temp_dir, f"{base}_segment_{idx}_adjusted.mp3")
+
+                if tts_duration > 0 and segment_duration > 0:
+                    # Calculate speed factor (1.0 = normal, >1.0 = faster, <1.0 = slower)
+                    speed_factor = tts_duration / segment_duration
+
+                    # More conservative speed limits for natural speech (0.75x to 1.25x)
+                    # This prevents speech from sounding too fast or too slow
+                    speed_factor = max(0.75, min(1.25, speed_factor))
+
+                    # Only adjust if the difference is significant (more than 15%)
+                    # This allows natural variation in speech pace
+                    if abs(speed_factor - 1.0) > 0.15:
+                        # Use atempo filter with conservative adjustments
+                        adjust_cmd = f'ffmpeg -y -i "{segment_audio}" -af "atempo={speed_factor:.3f}" "{adjusted_audio}"'
+
+                        if run_ffmpeg_command(adjust_cmd) and os.path.exists(adjusted_audio):
+                            # Get new duration after speed adjustment
+                            try:
+                                probe_cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{adjusted_audio}"'
+                                result_probe = subprocess.run(probe_cmd, shell=True, capture_output=True, text=True, timeout=10)
+                                adjusted_duration_str = result_probe.stdout.strip()
+                                if adjusted_duration_str:
+                                    adjusted_duration = float(adjusted_duration_str)
+                                else:
+                                    adjusted_duration = tts_duration / speed_factor
+                            except:
+                                adjusted_duration = tts_duration / speed_factor
+
+                            # Use adjusted duration (more natural) instead of forcing exact match
+                            # Add silence padding if needed, but don't force exact timing
+                            final_segment_audio = os.path.join(temp_dir, f"{base}_segment_{idx}_final.mp3")
+
+                            if adjusted_duration < segment_duration:
+                                # TTS is shorter - pad with silence at the end
+                                pad_cmd = (
+                                    f'ffmpeg -y -i "{adjusted_audio}" '
+                                    f'-af "apad=pad_dur={segment_duration}" '
+                                    f'-t {segment_duration} "{final_segment_audio}"'
+                                )
+                            elif adjusted_duration > segment_duration * 1.1:
+                                # TTS is significantly longer - trim to segment duration
+                                pad_cmd = (
+                                    f'ffmpeg -y -i "{adjusted_audio}" '
+                                    f'-af "atrim=0:{segment_duration}" '
+                                    f'-t {segment_duration} "{final_segment_audio}"'
+                                )
+                            else:
+                                # Close enough - use as is, just ensure it doesn't exceed
+                                pad_cmd = (
+                                    f'ffmpeg -y -i "{adjusted_audio}" '
+                                    f'-af "atrim=0:{min(adjusted_duration, segment_duration * 1.1)}" '
+                                    f'-t {min(adjusted_duration, segment_duration * 1.1)} "{final_segment_audio}"'
+                                )
+
+                            if run_ffmpeg_command(pad_cmd) and os.path.exists(final_segment_audio):
+                                # Use actual duration instead of forcing segment_duration
+                                actual_duration = min(adjusted_duration, segment_duration * 1.1)
+                                segment_audio_files.append((final_segment_audio, segment_start, actual_duration))
+                            else:
+                                # Fallback to adjusted audio
+                                actual_duration = min(adjusted_duration, segment_duration * 1.1)
+                                segment_audio_files.append((adjusted_audio, segment_start, actual_duration))
+                        else:
+                            # Speed adjustment failed, use original
+                            segment_audio_files.append((segment_audio, segment_start, min(tts_duration, segment_duration * 1.1)))
+                    else:
+                        # Speed is close to natural - use TTS as is with minimal adjustment
+                        final_segment_audio = os.path.join(temp_dir, f"{base}_segment_{idx}_final.mp3")
+
+                        # Allow TTS to be slightly longer/shorter naturally
+                        target_duration = min(tts_duration, segment_duration * 1.1)
+
+                        if tts_duration < segment_duration:
+                            # Pad with silence if shorter
+                            pad_cmd = (
+                                f'ffmpeg -y -i "{segment_audio}" '
+                                f'-af "apad=pad_dur={segment_duration}" '
+                                f'-t {segment_duration} "{final_segment_audio}"'
+                            )
+                        else:
+                            # Use TTS duration (up to 10% longer is acceptable for natural speech)
+                            pad_cmd = (
+                                f'ffmpeg -y -i "{segment_audio}" '
+                                f'-af "atrim=0:{target_duration}" '
+                                f'-t {target_duration} "{final_segment_audio}"'
+                            )
+
+                        if run_ffmpeg_command(pad_cmd) and os.path.exists(final_segment_audio):
+                            segment_audio_files.append((final_segment_audio, segment_start, target_duration))
+                        else:
+                            segment_audio_files.append((segment_audio, segment_start, min(tts_duration, segment_duration * 1.1)))
+                else:
+                    segment_audio_files.append((segment_audio, segment_start, segment_duration))
+            
+            if not segment_audio_files:
+                self.log_signal.emit("No audio segments generated.", "error")
+                return False
+            
+            # Concatenate all segments with proper timing
+            self.log_signal.emit("Synchronizing audio segments...", "info")
+            
+            # Get total video duration
             try:
-                communicate = edge_tts.Communicate(translated_text, self.voice_name)
-                await communicate.save(translated_audio)
-            except Exception as e:
-                self.log_signal.emit(f"TTS generation failed: {e}", "error")
+                probe_cmd = f'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "{downloaded}"'
+                result_probe = subprocess.run(probe_cmd, shell=True, capture_output=True, text=True, timeout=10)
+                total_duration = float(result_probe.stdout.strip())
+            except:
+                # Estimate from last segment
+                total_duration = segment_audio_files[-1][1] + segment_audio_files[-1][2]
+            
+            # Build synchronized audio by placing segments at correct timestamps
+            # Method: Normalize all segments first, then create silence + segment pairs, then concatenate
+            self.log_signal.emit("Normalizing audio segments...", "info")
+            
+            # First, normalize all segment audio files to same format (44100 Hz, stereo, WAV)
+            normalized_segments = []
+            for idx, (seg_file, start_time, duration) in enumerate(segment_audio_files):
+                normalized_file = os.path.join(temp_dir, f"{base}_normalized_{idx}.wav")
+                normalize_cmd = (
+                    f'ffmpeg -y -i "{seg_file}" '
+                    f'-ar 44100 -ac 2 -acodec pcm_s16le "{normalized_file}"'
+                )
+                if run_ffmpeg_command(normalize_cmd) and os.path.exists(normalized_file):
+                    normalized_segments.append((normalized_file, start_time, duration))
+                else:
+                    # Fallback: use original file
+                    normalized_segments.append((seg_file, start_time, duration))
+            
+            # Build synchronized audio by placing segments at correct timestamps
+            concat_list = os.path.join(temp_dir, f"{base}_concat.txt")
+            previous_end = 0.0
+            MIN_SILENCE_DURATION = 0.01  # Minimum 10ms to avoid floating point errors
+            
+            with open(concat_list, 'w', encoding='utf-8') as f:
+                for seg_file, start_time, duration in normalized_segments:
+                    # Round values to avoid floating point precision issues
+                    start_time = round(start_time, 6)
+                    duration = round(duration, 6)
+                    previous_end = round(previous_end, 6)
+                    
+                    # Handle overlapping segments (if segment starts before previous ends)
+                    if start_time < previous_end:
+                        # Adjust start time to avoid overlap
+                        start_time = previous_end
+                    
+                    # Add silence before segment if there's a significant gap
+                    if start_time > previous_end:
+                        silence_duration = round(start_time - previous_end, 6)
+                        # Only create silence if duration is meaningful (with extra safety margin)
+                        if silence_duration >= MIN_SILENCE_DURATION and silence_duration > 0.001:
+                            silence_file = os.path.join(temp_dir, f"{base}_silence_{int(start_time * 1000)}.wav")
+                            # Use rounded duration with proper formatting
+                            silence_cmd = f'ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t {max(silence_duration, MIN_SILENCE_DURATION):.6f} "{silence_file}"'
+                            if run_ffmpeg_command(silence_cmd) and os.path.exists(silence_file):
+                                # Use absolute path for concat file
+                                f.write(f"file '{os.path.abspath(silence_file)}'\n")
+                    
+                    # Add the segment (normalized to WAV format)
+                    f.write(f"file '{os.path.abspath(seg_file)}'\n")
+                    previous_end = round(max(previous_end, start_time + duration), 6)
+                
+                # Add final silence if needed to match video duration
+                if previous_end < total_duration:
+                    final_silence_duration = round(total_duration - previous_end, 6)
+                    if final_silence_duration >= MIN_SILENCE_DURATION and final_silence_duration > 0.001:
+                        final_silence_file = os.path.join(temp_dir, f"{base}_silence_final.wav")
+                        silence_cmd = f'ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t {max(final_silence_duration, MIN_SILENCE_DURATION):.6f} "{final_silence_file}"'
+                        if run_ffmpeg_command(silence_cmd) and os.path.exists(final_silence_file):
+                            f.write(f"file '{os.path.abspath(final_silence_file)}'\n")
+            
+            # Concatenate all parts (all should be WAV format now)
+            # Use .m4a extension explicitly to ensure AAC encoding
+            concat_cmd = f'ffmpeg -y -f concat -safe 0 -i "{concat_list}" -c:a aac -b:a 192k -ar 44100 -ac 2 -f mp4 "{translated_audio}"'
+            if not run_ffmpeg_command(concat_cmd):
+                self.log_signal.emit("Failed creating synchronized audio.", "error")
                 return False
 
             # Master audio
@@ -393,9 +678,19 @@ class Worker(QThread):
             self.log_signal.emit(f"Error processing video: {str(e)}", "error")
             return False
         finally:
-            for f in [downloaded, extracted_audio, music_audio, translated_audio, 
+            # Clean up all temporary files
+            cleanup_files = [
+                downloaded, extracted_audio, music_audio, translated_audio, 
                      mastered_audio, video_no_audio, final_with_watermark,
-                     os.path.join(temp_dir, f"{base}_mixed_audio.aac")]:
+                os.path.join(temp_dir, f"{base}_mixed_audio.aac"),
+                os.path.join(temp_dir, f"{base}_concat.txt")
+            ]
+            
+            # Add segment files, normalized files, and silence files (they may not exist if error occurred early)
+            for pattern in [f"{base}_segment_*.mp3", f"{base}_segment_*_raw.mp3", f"{base}_normalized_*.wav", f"{base}_silence_*.wav"]:
+                cleanup_files.extend(glob.glob(os.path.join(temp_dir, pattern)))
+            
+            for f in cleanup_files:
                 try:
                     if f and os.path.exists(f):
                         os.remove(f)
@@ -635,54 +930,63 @@ class TikTokTranslatorApp(QtWidgets.QMainWindow):
         
     def setup_ui(self):
         self.setWindowTitle("Video Translator Pro")
-        self.setMinimumSize(1000, 700)
+        self.setMinimumSize(1200, 800)
         
         # Set dark theme
         self.setStyleSheet("""
             QMainWindow {
-                background: #111827;
+                background: #0F172A;
             }
             QLabel {
                 color: #E5E7EB;
             }
         """)
         
-        # Central widget
+        # Central widget with scroll area
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        
         central_widget = QtWidgets.QWidget()
-        self.setCentralWidget(central_widget)
+        scroll.setWidget(central_widget)
+        self.setCentralWidget(scroll)
         
         # Main layout
         main_layout = QtWidgets.QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(20, 15, 20, 15)
-        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(25, 20, 25, 20)
+        main_layout.setSpacing(25)
         
-        # Left panel (content)
+        # Left panel (content) - wider
         left_panel = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(20)
+        left_layout.setSpacing(18)
         
-        # Header
-        header = QtWidgets.QLabel("Video Translator Pro")
+        # Header with better styling
+        header = QtWidgets.QLabel("🎬 Video Translator Pro")
         header.setStyleSheet("""
             QLabel {
                 color: #8B5CF6;
-                font-size: 22px;
+                font-size: 28px;
                 font-weight: bold;
-                padding: 5px;
+                padding: 10px 0px;
             }
         """)
         left_layout.addWidget(header)
         
-        # Video URLs card
-        url_card = ModernCard("Video Sources")
+        # Video URLs card - compact
+        url_card = ModernCard("📹 Video Sources")
+        url_card.content_layout.setSpacing(12)
         
         platform_layout = QtWidgets.QHBoxLayout()
-        platform_layout.addWidget(QtWidgets.QLabel("Platform:"))
+        platform_label = QtWidgets.QLabel("Platform:")
+        platform_label.setStyleSheet("color: #D1D5DB; font-size: 13px; min-width: 70px;")
+        platform_layout.addWidget(platform_label)
         self.platform_combo = ModernComboBox()
         self.platform_combo.addItems(PLATFORMS.keys())
         self.platform_combo.currentTextChanged.connect(self.update_url_placeholder)
-        platform_layout.addWidget(self.platform_combo)
+        platform_layout.addWidget(self.platform_combo, 1)
         url_card.content_layout.addLayout(platform_layout)
         
         url_label = QtWidgets.QLabel("Video URLs (one per line):")
@@ -690,117 +994,242 @@ class TikTokTranslatorApp(QtWidgets.QMainWindow):
         url_card.content_layout.addWidget(url_label)
         
         self.url_input = ModernTextEdit()
-        self.url_input.setFixedHeight(100)
+        self.url_input.setFixedHeight(120)
         url_card.content_layout.addWidget(self.url_input)
         
         left_layout.addWidget(url_card)
         
-        # Translation settings card
-        trans_card = ModernCard("Translation Settings")
+        # Translation & Voice Settings - Combined card
+        settings_card = ModernCard("⚙️ Translation & Voice Settings")
+        settings_card.content_layout.setSpacing(15)
         
-        lang_layout = QtWidgets.QHBoxLayout()
-        lang_layout.addWidget(QtWidgets.QLabel("Language:"))
+        # Language and Voice in one row
+        lang_voice_row = QtWidgets.QHBoxLayout()
+        lang_voice_row.setSpacing(15)
+        
+        lang_container = QtWidgets.QVBoxLayout()
+        lang_container.setSpacing(5)
+        lang_label = QtWidgets.QLabel("Language:")
+        lang_label.setStyleSheet("color: #D1D5DB; font-size: 12px;")
+        lang_container.addWidget(lang_label)
         self.lang_combo = ModernComboBox()
         self.lang_combo.addItems(LANGUAGES.keys())
         self.lang_combo.currentTextChanged.connect(self.update_voices)
-        lang_layout.addWidget(self.lang_combo)
-        trans_card.content_layout.addLayout(lang_layout)
+        lang_container.addWidget(self.lang_combo)
+        lang_voice_row.addLayout(lang_container, 1)
         
-        voice_layout = QtWidgets.QHBoxLayout()
-        voice_layout.addWidget(QtWidgets.QLabel("Voice:"))
+        voice_container = QtWidgets.QVBoxLayout()
+        voice_container.setSpacing(5)
+        voice_label = QtWidgets.QLabel("Voice:")
+        voice_label.setStyleSheet("color: #D1D5DB; font-size: 12px;")
+        voice_container.addWidget(voice_label)
         self.voice_combo = ModernComboBox()
-        voice_layout.addWidget(self.voice_combo)
-        trans_card.content_layout.addLayout(voice_layout)
+        voice_container.addWidget(self.voice_combo)
+        lang_voice_row.addLayout(voice_container, 1)
         
-        # Volume slider
-        vol_layout = QtWidgets.QVBoxLayout()
-        vol_label_layout = QtWidgets.QHBoxLayout()
-        vol_label_layout.addWidget(QtWidgets.QLabel("Background Music Volume:"))
+        settings_card.content_layout.addLayout(lang_voice_row)
+        
+        # Voice Customization - Compact inline
+        voice_custom_row = QtWidgets.QHBoxLayout()
+        voice_custom_row.setSpacing(12)
+        
+        # Template
+        template_container = QtWidgets.QVBoxLayout()
+        template_container.setSpacing(5)
+        template_label = QtWidgets.QLabel("Preset:")
+        template_label.setStyleSheet("color: #D1D5DB; font-size: 12px;")
+        template_container.addWidget(template_label)
+        self.voice_template_combo = ModernComboBox()
+        self.voice_template_combo.addItems(VOICE_TEMPLATES.keys())
+        self.voice_template_combo.setCurrentText("Normal")
+        self.voice_template_combo.currentTextChanged.connect(self.apply_voice_template)
+        template_container.addWidget(self.voice_template_combo)
+        voice_custom_row.addLayout(template_container, 1)
+        
+        # Preview button
+        preview_container = QtWidgets.QVBoxLayout()
+        preview_container.setSpacing(5)
+        preview_spacer = QtWidgets.QLabel("")
+        preview_spacer.setFixedHeight(20)
+        preview_container.addWidget(preview_spacer)
+        preview_btn = ModernButton("🔊 Preview", primary=True)
+        preview_btn.setMinimumHeight(36)
+        preview_btn.clicked.connect(self.preview_voice)
+        preview_container.addWidget(preview_btn)
+        voice_custom_row.addLayout(preview_container, 1)
+        
+        settings_card.content_layout.addLayout(voice_custom_row)
+        
+        # Voice sliders - compact horizontal
+        sliders_row = QtWidgets.QHBoxLayout()
+        sliders_row.setSpacing(15)
+        
+        # Pitch
+        pitch_box = QtWidgets.QVBoxLayout()
+        pitch_box.setSpacing(4)
+        pitch_header = QtWidgets.QHBoxLayout()
+        pitch_name = QtWidgets.QLabel("Pitch")
+        pitch_name.setStyleSheet("color: #D1D5DB; font-size: 11px;")
+        pitch_header.addWidget(pitch_name)
+        self.pitch_label = QtWidgets.QLabel("0")
+        self.pitch_label.setStyleSheet("color: #8B5CF6; font-weight: bold; font-size: 11px;")
+        pitch_header.addWidget(self.pitch_label)
+        pitch_box.addLayout(pitch_header)
+        self.pitch_slider = ModernSlider()
+        self.pitch_slider.setRange(-12, 12)
+        self.pitch_slider.setValue(0)
+        self.pitch_slider.valueChanged.connect(lambda v: self.pitch_label.setText(f"{v:+d}"))
+        pitch_box.addWidget(self.pitch_slider)
+        sliders_row.addLayout(pitch_box, 1)
+        
+        # Speed
+        speed_box = QtWidgets.QVBoxLayout()
+        speed_box.setSpacing(4)
+        speed_header = QtWidgets.QHBoxLayout()
+        speed_name = QtWidgets.QLabel("Speed")
+        speed_name.setStyleSheet("color: #D1D5DB; font-size: 11px;")
+        speed_header.addWidget(speed_name)
+        self.speed_label = QtWidgets.QLabel("1.0x")
+        self.speed_label.setStyleSheet("color: #8B5CF6; font-weight: bold; font-size: 11px;")
+        speed_header.addWidget(self.speed_label)
+        speed_box.addLayout(speed_header)
+        self.speed_slider = ModernSlider()
+        self.speed_slider.setRange(50, 200)
+        self.speed_slider.setValue(100)
+        self.speed_slider.valueChanged.connect(lambda v: self.speed_label.setText(f"{v/100:.1f}x"))
+        speed_box.addWidget(self.speed_slider)
+        sliders_row.addLayout(speed_box, 1)
+        
+        # Voice Volume
+        vol_box = QtWidgets.QVBoxLayout()
+        vol_box.setSpacing(4)
+        vol_header = QtWidgets.QHBoxLayout()
+        vol_name = QtWidgets.QLabel("Voice Vol")
+        vol_name.setStyleSheet("color: #D1D5DB; font-size: 11px;")
+        vol_header.addWidget(vol_name)
+        self.voice_vol_label = QtWidgets.QLabel("100%")
+        self.voice_vol_label.setStyleSheet("color: #8B5CF6; font-weight: bold; font-size: 11px;")
+        vol_header.addWidget(self.voice_vol_label)
+        vol_box.addLayout(vol_header)
+        self.voice_vol_slider = ModernSlider()
+        self.voice_vol_slider.setRange(50, 150)
+        self.voice_vol_slider.setValue(100)
+        self.voice_vol_slider.valueChanged.connect(lambda v: self.voice_vol_label.setText(f"{v}%"))
+        vol_box.addWidget(self.voice_vol_slider)
+        sliders_row.addLayout(vol_box, 1)
+        
+        settings_card.content_layout.addLayout(sliders_row)
+        
+        # Background Music Volume
+        bg_vol_container = QtWidgets.QVBoxLayout()
+        bg_vol_container.setSpacing(5)
+        bg_vol_header = QtWidgets.QHBoxLayout()
+        bg_vol_name = QtWidgets.QLabel("Background Music Volume:")
+        bg_vol_name.setStyleSheet("color: #D1D5DB; font-size: 12px;")
+        bg_vol_header.addWidget(bg_vol_name)
         self.vol_label = QtWidgets.QLabel("30%")
-        self.vol_label.setStyleSheet("color: #8B5CF6; font-weight: bold;")
-        vol_label_layout.addWidget(self.vol_label)
-        vol_layout.addLayout(vol_label_layout)
-        
+        self.vol_label.setStyleSheet("color: #8B5CF6; font-weight: bold; font-size: 12px;")
+        bg_vol_header.addWidget(self.vol_label)
+        bg_vol_container.addLayout(bg_vol_header)
         self.vol_slider = ModernSlider()
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(30)
         self.vol_slider.valueChanged.connect(lambda v: self.vol_label.setText(f"{v}%"))
-        vol_layout.addWidget(self.vol_slider)
+        bg_vol_container.addWidget(self.vol_slider)
+        settings_card.content_layout.addLayout(bg_vol_container)
         
-        trans_card.content_layout.addLayout(vol_layout)
-        left_layout.addWidget(trans_card)
+        left_layout.addWidget(settings_card)
         
-        # Action buttons
+        # Action buttons - better layout
+        btn_card = ModernCard("")
+        btn_card.setStyleSheet("QFrame { background: transparent; border: none; }")
         btn_layout = QtWidgets.QHBoxLayout()
-        btn_layout.setSpacing(10)
+        btn_layout.setSpacing(12)
         
-        self.start_btn = ModernButton("Start Processing", primary=True)
+        self.start_btn = ModernButton("▶ Start Processing", primary=True)
+        self.start_btn.setMinimumHeight(50)
         self.start_btn.clicked.connect(self.start_clicked)
-        btn_layout.addWidget(self.start_btn)
+        btn_layout.addWidget(self.start_btn, 2)
         
-        self.stop_btn = ModernButton("Stop")
+        self.stop_btn = ModernButton("⏹ Stop")
+        self.stop_btn.setMinimumHeight(50)
         self.stop_btn.clicked.connect(self.stop_clicked)
         self.stop_btn.setEnabled(False)
-        btn_layout.addWidget(self.stop_btn)
+        btn_layout.addWidget(self.stop_btn, 1)
         
-        self.open_folder_btn = ModernButton("Open Folder")
+        self.open_folder_btn = ModernButton("📁 Open Folder")
+        self.open_folder_btn.setMinimumHeight(50)
         self.open_folder_btn.clicked.connect(self.open_output_folder)
-        btn_layout.addWidget(self.open_folder_btn)
+        btn_layout.addWidget(self.open_folder_btn, 1)
         
-        left_layout.addLayout(btn_layout)
+        settings_btn = ModernButton("⚙️ Settings")
+        settings_btn.setMinimumHeight(50)
+        settings_btn.clicked.connect(self.show_settings_dialog)
+        btn_layout.addWidget(settings_btn, 1)
         
-        # Progress bar
+        btn_card.content_layout.addLayout(btn_layout)
+        left_layout.addWidget(btn_card)
+        
+        # Progress bar - better styling
+        progress_card = ModernCard("")
+        progress_card.setStyleSheet("QFrame { background: transparent; border: none; }")
         progress_layout = QtWidgets.QVBoxLayout()
-        self.progress_bar = ModernProgressBar()
-        self.progress_bar.setVisible(False)
-        progress_layout.addWidget(self.progress_bar)
+        progress_layout.setSpacing(8)
         
         self.progress_text = QtWidgets.QLabel("Ready to process videos")
-        self.progress_text.setStyleSheet("color: #9CA3AF; text-align: center; font-size: 12px;")
+        self.progress_text.setStyleSheet("color: #9CA3AF; text-align: center; font-size: 13px; padding: 5px;")
         progress_layout.addWidget(self.progress_text)
         
-        left_layout.addLayout(progress_layout)
+        self.progress_bar = ModernProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setMinimumHeight(10)
+        progress_layout.addWidget(self.progress_bar)
         
-        # Settings button
-        settings_btn = ModernButton("Advanced Settings")
-        settings_btn.clicked.connect(self.show_settings_dialog)
-        left_layout.addWidget(settings_btn)
+        progress_card.content_layout.addLayout(progress_layout)
+        left_layout.addWidget(progress_card)
         
         left_layout.addStretch()
         
-        # Right panel (log)
+        # Right panel (log) - improved
         right_panel = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
         
-        log_card = ModernCard("Processing Log")
-        log_card.setFixedWidth(350)
+        log_card = ModernCard("📋 Processing Log")
+        log_card.setFixedWidth(380)
+        
+        # Clear button at top
+        clear_btn_layout = QtWidgets.QHBoxLayout()
+        clear_btn_layout.addStretch()
+        clear_btn = ModernButton("🗑️ Clear", primary=False)
+        clear_btn.setMaximumWidth(100)
+        clear_btn.clicked.connect(lambda: self.log_display.clear())
+        clear_btn_layout.addWidget(clear_btn)
+        log_card.content_layout.addLayout(clear_btn_layout)
         
         self.log_display = QtWidgets.QTextEdit()
         self.log_display.setReadOnly(True)
         self.log_display.setStyleSheet("""
             QTextEdit {
-                background: rgba(255, 255, 255, 0.05);
+                background: rgba(15, 23, 42, 0.8);
                 color: #E5E7EB;
                 border: 1px solid rgba(255, 255, 255, 0.1);
-                border-radius: 6px;
-                padding: 10px;
+                border-radius: 8px;
+                padding: 12px;
                 font-family: 'Consolas', 'Courier New', monospace;
                 font-size: 11px;
+                line-height: 1.4;
             }
         """)
-        self.log_display.setFixedHeight(500)
+        self.log_display.setFixedHeight(600)
         log_card.content_layout.addWidget(self.log_display)
         
-        # Clear log button
-        clear_btn = ModernButton("Clear Log")
-        clear_btn.clicked.connect(lambda: self.log_display.clear())
-        log_card.content_layout.addWidget(clear_btn)
-        
         right_layout.addWidget(log_card)
+        right_layout.addStretch()
         
         # Add panels to main layout
-        main_layout.addWidget(left_panel, 3)
+        main_layout.addWidget(left_panel, 2)
         main_layout.addWidget(right_panel, 1)
         
         # Initialize
@@ -818,6 +1247,78 @@ class TikTokTranslatorApp(QtWidgets.QMainWindow):
         platform = self.platform_combo.currentText()
         example_url = PLATFORMS.get(platform, {}).get("example", "https://example.com/video/123")
         self.url_input.setPlaceholderText(f"Paste {platform} URLs (one per line)\nExample: {example_url}")
+
+    def apply_voice_template(self, template_name):
+        """Apply voice template settings to sliders"""
+        if template_name in VOICE_TEMPLATES:
+            template = VOICE_TEMPLATES[template_name]
+            self.pitch_slider.setValue(template["pitch"])
+            self.speed_slider.setValue(int(template["speed"] * 100))
+            self.voice_vol_slider.setValue(int(template["volume"] * 100))
+
+    async def preview_voice_async(self, text, voice_name, pitch, speed, volume):
+        """Async function to generate and apply voice effects for preview"""
+        import tempfile
+        temp_dir = tempfile.gettempdir()
+        preview_file_raw = os.path.join(temp_dir, "voice_preview_raw.mp3")
+        preview_file = os.path.join(temp_dir, "voice_preview.mp3")
+        
+        try:
+            # Generate TTS
+            communicate = edge_tts.Communicate(text, voice_name)
+            await communicate.save(preview_file_raw)
+            
+            # Apply effects
+            if pitch != 0 or speed != 1.0 or volume != 1.0:
+                apply_voice_effects(preview_file_raw, preview_file, pitch, speed, volume)
+            else:
+                shutil.copyfile(preview_file_raw, preview_file)
+            
+            return preview_file
+        except Exception as e:
+            return None
+
+    def preview_voice(self):
+        """Preview voice with current settings"""
+        # Get current settings
+        voice_name = self.voice_combo.currentText()
+        if not voice_name:
+            self.append_log("Please select a voice first", "warning")
+            return
+        
+        pitch = self.pitch_slider.value()
+        speed = self.speed_slider.value() / 100.0
+        volume = self.voice_vol_slider.value() / 100.0
+        
+        # Sample text for preview (in Albanian for Ilir/Anila)
+        preview_text = "Përshëndetje, ky është një parashikim i zërit tuaj."
+        
+        # Show loading message
+        self.append_log("Generating voice preview...", "info")
+        
+        # Run async preview
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        preview_file = loop.run_until_complete(
+            self.preview_voice_async(preview_text, voice_name, pitch, speed, volume)
+        )
+        loop.close()
+        
+        if preview_file and os.path.exists(preview_file):
+            # Play the preview
+            try:
+                if sys.platform == "win32":
+                    os.startfile(preview_file)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["afplay", preview_file])
+                else:
+                    subprocess.Popen(["aplay", preview_file])
+                self.append_log("Playing voice preview...", "success")
+            except Exception as e:
+                self.append_log(f"Failed to play preview: {e}", "error")
+        else:
+            self.append_log("Failed to generate preview", "error")
 
     def show_settings_dialog(self):
         dialog = QtWidgets.QDialog(self)
@@ -987,6 +1488,11 @@ class TikTokTranslatorApp(QtWidgets.QMainWindow):
         lang_code = LANGUAGES.get(lang_name, ("en", []))[0]
         voice = self.voice_combo.currentText() or LANGUAGES.get(lang_name, ("en", []))[1][0]
         bg_volume = self.vol_slider.value()
+        
+        # Get voice customization settings
+        voice_pitch = self.pitch_slider.value()
+        voice_speed = self.speed_slider.value() / 100.0
+        voice_volume = self.voice_vol_slider.value() / 100.0
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -1006,7 +1512,10 @@ class TikTokTranslatorApp(QtWidgets.QMainWindow):
             self.settings["audio_normalize"],
             self.settings["retry_attempts"],
             self.settings["platform"],
-            self.settings["watermark_position"]
+            self.settings["watermark_position"],
+            voice_pitch,
+            voice_speed,
+            voice_volume
         )
         self.worker.log_signal.connect(self.append_log)
         self.worker.progress_signal.connect(self.update_progress)
